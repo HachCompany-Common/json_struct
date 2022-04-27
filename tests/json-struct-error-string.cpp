@@ -1,5 +1,5 @@
 /*
- * Copyright © 2021 Jorgen Lind
+ * Copyright ï¿½ 2021 Jorgen Lind
  *
  * Permission to use, copy, modify, distribute, and sell this software and its
  * documentation for any purpose is hereby granted without fee, provided that
@@ -29,8 +29,8 @@ namespace
 
 static const char json_data1[] = R"json({
   /* Invalid stuff */
-  "One" : "foo / bar",
-  "Two" : "foo \/ bar"
+  "One": "foo / bar",
+  "Two": "foo \/ bar"
 })json";
 
 struct Struct
@@ -51,4 +51,66 @@ TEST_CASE("test_make_error_string", "[json_struct][error]")
   std::string errorString = context.makeErrorString();
   REQUIRE(errorString.size() != 0);
 }
+
+TEST_CASE("test_make_error_string_unnasigned_required_member", "[json_struct][error]")
+{
+  static const char json_data[] = R"json({
+  "One": "foo / bar"
+  })json";
+
+  JS::ParseContext context(json_data);
+  context.allow_missing_members = false;
+  context.allow_unnasigned_required_members = false;
+  Struct substruct;
+  context.parseTo(substruct);
+
+  REQUIRE(context.error != JS::Error::NoError);
+
+  std::string errorString = context.makeErrorString();
+  REQUIRE(errorString.size() != 0);
+}
+
+TEST_CASE("test_make_error_string_missing_member", "[json_struct][error]")
+{
+  static const char json_data[] = R"json({
+  "One": "foo / bar",
+  "Two": "foo \/ bar",
+  "Three": "foo \/ bar"
+  })json";
+
+  JS::ParseContext context(json_data);
+  context.allow_missing_members = false;
+  context.allow_unnasigned_required_members = false;
+  Struct substruct;
+  context.parseTo(substruct);
+  context.error = JS::Error::MissingPropertyMember;
+
+  REQUIRE(context.error != JS::Error::NoError);
+
+  std::string errorString = context.makeErrorString();
+  REQUIRE(errorString.size() != 0);
+}
+
+TEST_CASE("test_make_error_string_missing_members", "[json_struct][error]")
+{
+  static const char json_data[] = R"json({
+  "One": "foo / bar",
+  "Two": "foo \/ bar",
+  "Three": "foo \/ bar",
+  "Four": 4232
+  })json";
+
+  JS::ParseContext context(json_data);
+  context.allow_missing_members = true;
+  context.allow_unnasigned_required_members = false;
+  Struct substruct;
+  context.parseTo(substruct);
+  context.error = JS::Error::MissingPropertyMember;
+
+  REQUIRE(context.error != JS::Error::NoError);
+
+  std::string errorString = context.makeErrorString();
+  REQUIRE(errorString.size() != 0);
+}
+
 } // namespace

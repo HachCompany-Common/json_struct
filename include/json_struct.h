@@ -174,6 +174,110 @@
 #define JS JS
 #endif
 
+/*!
+ *  \brief int128 support
+ */
+namespace JS
+{
+// Overrides for used type_traits
+template< class T > struct js_remove_cv                   { typedef T type; };
+template< class T > struct js_remove_cv<const T>          { typedef T type; };
+template< class T > struct js_remove_cv<volatile T>       { typedef T type; };
+template< class T > struct js_remove_cv<const volatile T> { typedef T type; };
+
+template<typename T>
+  struct js_is_signed
+  : public std::is_signed<T>::type { };
+template<typename T>
+  struct js_is_unsigned
+  : public std::is_unsigned<T>::type { };
+
+template<typename T>
+  struct js_is_integral
+  : public std::is_integral<T>::type { };
+
+// Compiler support check
+#ifdef __SIZEOF_INT128__
+#define JS_INT_128
+typedef __int128 int128_t;
+typedef unsigned __int128 uint128_t;
+#endif
+
+// Add in our type_traits
+#ifdef JS_INT_128
+// TODO: cleanup. only doing this verbose method due to Intel DPCPP...
+template<>
+  struct js_is_signed<int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_unsigned<uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_integral<int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_integral<uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_signed<const int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_unsigned<const uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_integral<const int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_integral<const uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_signed<volatile int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_unsigned<volatile uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_integral<volatile int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_integral<volatile uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_signed<const volatile int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_unsigned<const volatile uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_integral<const volatile int128_t>
+  : public std::true_type { };
+template<>
+  struct js_is_integral<const volatile uint128_t>
+  : public std::true_type { };
+
+template<>
+  struct js_is_signed<js_remove_cv<int128_t>>
+  : public std::true_type { };
+template<>
+  struct js_is_unsigned<js_remove_cv<uint128_t>>
+  : public std::true_type { };
+
+template<>
+  struct js_is_integral<js_remove_cv<int128_t>>
+  : public std::true_type { };
+template<>
+  struct js_is_integral<js_remove_cv<uint128_t>>
+  : public std::true_type { };
+#endif
+}
+
 namespace JS
 {
 /*!
@@ -666,6 +770,7 @@ public:
   SerializerOptions(Style style = Style::Pretty);
 
   int shiftSize() const;
+  void setShiftSize(unsigned char set);
 
   Style style() const;
   void setStyle(Style style);
@@ -694,6 +799,14 @@ private:
   std::string m_value_delimiter;
   std::string m_postfix;
 };
+
+#if __cplusplus >= 201403L
+template<SerializerOptions::Style S = SerializerOptions::Style::Pretty>
+const static SerializerOptions DEFAULT_OPS = []() { // NOLINT(cppcoreguidelines-avoid-non-const-global-variables,cert-err58-cpp)
+  SerializerOptions ops(S);
+  return ops;
+}();
+#endif
 
 class SerializerBuffer
 {
@@ -1020,12 +1133,13 @@ static const char *error_strings[] = {
   "ScopeHasEnded",
   "KeyNotFound",
   "UnknownError",
+  "UserDefinedErrors",
 };
 }
 
 inline std::string Tokenizer::makeErrorString() const
 {
-  static_assert(sizeof(Internal::error_strings) / sizeof *Internal::error_strings == size_t(Error::UserDefinedErrors),
+  static_assert(sizeof(Internal::error_strings) / sizeof *Internal::error_strings == size_t(Error::UserDefinedErrors) + 1,
                 "Please add missing error message");
 
   std::string retString("Error");
@@ -1743,19 +1857,24 @@ inline Error Tokenizer::updateErrorContext(Error error, const std::string &custo
 
 inline SerializerOptions::SerializerOptions(Style style)
 
-  : m_shift_size(4)
+  : m_shift_size(style == Compact ? 0 : 2)
   , m_depth(0)
   , m_style(style)
   , m_convert_ascii_to_string(true)
   , m_token_delimiter(",")
+  , m_value_delimiter(style == Pretty ? ": " : ":")
+  , m_postfix(style == Pretty ? "\n" : "")
 {
-  m_value_delimiter = m_style == Pretty ? std::string(" : ") : std::string(":");
-  m_postfix = m_style == Pretty ? std::string("\n") : std::string("");
 }
 
 inline int SerializerOptions::shiftSize() const
 {
   return m_shift_size;
+}
+
+inline void SerializerOptions::setShiftSize(unsigned char set)
+{
+  m_shift_size = set;
 }
 
 inline unsigned char SerializerOptions::depth() const
@@ -2322,6 +2441,11 @@ struct OptionalChecked
   {
     return data;
   }
+#ifdef JS_STD_OPTIONAL
+  std::optional<T> opt() const {
+    return assigned ? std::optional<T>(data) : std::nullopt;
+  }
+#endif
   T data;
   bool assigned;
   typedef bool IsOptionalType;
@@ -2546,6 +2670,45 @@ struct ParseContext
 
   std::string makeErrorString() const
   {
+    if (error == Error::MissingPropertyMember)
+    {
+      if (missing_members.size() == 0)
+      {
+        return "";
+      }
+      else if (missing_members.size() == 1)
+      {
+        return std::string("JSON Object contained member not found in C++ struct/class. JSON Object member is: ") + missing_members.front();
+      }
+      std::string member_string = missing_members.front();
+      for (int i = 1; i < missing_members.size(); i++)
+        member_string += std::string(", ") + missing_members[i];
+      return std::string("JSON Object contained members not found in C++ struct/class. JSON Object members are: ") + member_string;
+    }
+    else if (error  == Error::UnassignedRequiredMember)
+    {
+      if (unassigned_required_members.size() == 0)
+      {
+        return "";
+      }
+      else if (unassigned_required_members.size() == 1)
+      {
+        return std::string("C++ struct/class has a required member that is not present in input JSON. The unassigned C++ member is: ") + unassigned_required_members.front();
+      }
+      std::string required_string = unassigned_required_members.front();
+      for (int i = 1; i< unassigned_required_members.size(); i++)
+        required_string += std::string(", ") + unassigned_required_members[i];
+      return std::string("C++ struct/class has required members that are not present in the input JSON. The unassigned C++ members are: ") + required_string;
+    }
+    if (tokenizer.errorContext().error == Error::NoError && error != Error::NoError)
+    {
+      std::string retString("Error:");
+      if (error <= Error::UserDefinedErrors)
+        retString += Internal::error_strings[int(error)];
+      else
+        retString += "Unknown error";
+      return retString;
+    }
     return tokenizer.makeErrorString();
   }
 
@@ -3189,6 +3352,9 @@ inline Error ParseContext::parseTo(T &to_type)
   if (error != JS::Error::NoError)
     return error;
   error = TypeHandler<T>::to(to_type, *this);
+  if (error != JS::Error::NoError && tokenizer.errorContext().error == JS::Error::NoError) {
+    tokenizer.updateErrorContext(error);
+  }
   return error;
 }
 
@@ -5082,13 +5248,13 @@ struct CharsInDigit<T, -1, CURRENT>
 };
 
 template <typename T>
-T iabs(typename std::enable_if<std::is_unsigned<T>::value, T>::type a)
+T iabs(typename std::enable_if<js_is_unsigned<T>::value, T>::type a)
 {
   return a;
 }
 
 template <typename T>
-T iabs(typename std::enable_if<std::is_signed<T>::value, T>::type a)
+T iabs(typename std::enable_if<js_is_signed<T>::value, T>::type a)
 {
   // this
   if (a > 0)
@@ -6544,11 +6710,11 @@ namespace integer
 template <typename T>
 inline int to_buffer(T integer, char *buffer, int buffer_size, int *digits_truncated = nullptr)
 {
-  static_assert(std::is_integral<T>::value, "Tryint to convert non int to string");
+  static_assert(js_is_integral<T>::value, "Tryint to convert non int to string");
   int chars_to_write = ft::count_chars(integer);
   char *target_buffer = buffer;
   bool negative = false;
-  if (std::is_signed<T>::value)
+  if (js_is_signed<T>::value)
   {
     if (integer < 0)
     {
@@ -6575,7 +6741,7 @@ inline int to_buffer(T integer, char *buffer, int buffer_size, int *digits_trunc
   for (int i = 0; i < chars_to_write; i++)
   {
     int remainder = integer % 10;
-    if (std::is_signed<T>::value)
+    if (js_is_signed<T>::value)
     {
       if (negative)
         remainder = -remainder;
@@ -6588,14 +6754,14 @@ inline int to_buffer(T integer, char *buffer, int buffer_size, int *digits_trunc
 }
 
 template <typename T>
-inline typename std::enable_if<std::is_signed<T>::value, T>::type make_integer_return_value(uint64_t significand,
+inline typename std::enable_if<js_is_signed<T>::value, T>::type make_integer_return_value(uint64_t significand,
                                                                                             bool negative)
 {
   return negative ? -T(significand) : T(significand);
 }
 
 template <typename T>
-inline typename std::enable_if<std::is_unsigned<T>::value, T>::type make_integer_return_value(uint64_t significand,
+inline typename std::enable_if<js_is_unsigned<T>::value, T>::type make_integer_return_value(uint64_t significand,
                                                                                               bool)
 {
   return T(significand);
@@ -6817,6 +6983,75 @@ public:
     serializer.write(token);
   }
 };
+
+
+#ifdef JS_INT_128
+/// \private
+template <>
+struct TypeHandler<int128_t>
+{
+public:
+  static inline Error to(int128_t &to_type, ParseContext &context)
+  {
+    const char *pointer;
+    auto parse_error =
+      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
+    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
+      return Error::FailedToParseInt;
+    return Error::NoError;
+  }
+
+  static void from(const int128_t &from_type, Token &token, Serializer &serializer)
+  {
+    char buf[44];
+    int digits_truncated;
+    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
+    if (size <= 0 || digits_truncated)
+    {
+      fprintf(stderr, "error serializing int token\n");
+      return;
+    }
+
+    token.value_type = Type::Number;
+    token.value.data = buf;
+    token.value.size = size_t(size);
+    serializer.write(token);
+  }
+};
+
+/// \private
+template <>
+struct TypeHandler<uint128_t>
+{
+public:
+  static inline Error to(uint128_t &to_type, ParseContext &context)
+  {
+    const char *pointer;
+    auto parse_error =
+      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
+    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
+      return Error::FailedToParseInt;
+    return Error::NoError;
+  }
+
+  static inline void from(const uint128_t &from_type, Token &token, Serializer &serializer)
+  {
+    char buf[44];
+    int digits_truncated;
+    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
+    if (size <= 0 || digits_truncated)
+    {
+      fprintf(stderr, "error serializing int token\n");
+      return;
+    }
+
+    token.value_type = Type::Number;
+    token.value.data = buf;
+    token.value.size = size_t(size);
+    serializer.write(token);
+  }
+};
+#endif
 
 /// \private
 template <>
