@@ -470,6 +470,7 @@ enum class Error : unsigned char
   NonContigiousMemory,
   ScopeHasEnded,
   KeyNotFound,
+  DuplicateInSet,
   UnknownError,
   UserDefinedErrors
 };
@@ -1132,6 +1133,7 @@ static const char *error_strings[] = {
   "NonContigiousMemory",
   "ScopeHasEnded",
   "KeyNotFound",
+  "DuplicateInSet",
   "UnknownError",
   "UserDefinedErrors",
 };
@@ -2720,6 +2722,7 @@ struct ParseContext
   bool allow_missing_members = true;
   bool allow_unnasigned_required_members = true;
   bool track_member_assignement_state = true;
+  void* user_data = nullptr;
 };
 
 /*! \def JS_MEMBER
@@ -3311,6 +3314,7 @@ struct SuperClassHandler<T, PAGE, 0>
 static bool skipArrayOrObject(ParseContext &context)
 {
   assert(context.error == Error::NoError);
+  Type start_type = context.token.value_type;
   Type end_type;
   if (context.token.value_type == Type::ObjectStart)
   {
@@ -3325,21 +3329,25 @@ static bool skipArrayOrObject(ParseContext &context)
     return false;
   }
 
-  while ((context.error == Error::NoError && context.token.value_type != end_type))
+  int depth = 1;
+  while (depth > 0)
   {
     context.nextToken();
     if (context.error != Error::NoError)
-      return false;
-    if (context.token.value_type == Type::ObjectStart || context.token.value_type == Type::ArrayStart)
     {
-      if (skipArrayOrObject(context))
-        context.nextToken();
-      if (context.error != Error::NoError)
-        return false;
+      return false;
+    }
+    if (context.token.value_type == start_type)
+    {
+      depth++;
+    }
+    else if (context.token.value_type == end_type)
+    {
+      depth--;
     }
   }
 
-  return true;
+  return context.token.value_type == end_type && context.error == Error::NoError;
 }
 } // namespace Internal
 
@@ -3757,7 +3765,7 @@ struct JsonStructFunctionContainerDummy
   }
 
 #define JS_FUNC_OBJ(...) JS_FUNCTION_CONTAINER_INTERNAL_IMPL(JS::makeTuple(), JS::makeTuple(JS_INTERNAL_MAKE_FUNCTIONS(__VA_ARGS__)))
-#define JS_FUNCTION_CONTAINER(...) JS_FUNCTION_CONTAINER_INTERNAL_IMPL(JS::makeTuple(), JS::makeTuple(__VA_ARGS__)) 
+#define JS_FUNCTION_CONTAINER(...) JS_FUNCTION_CONTAINER_INTERNAL_IMPL(JS::makeTuple(), JS::makeTuple(__VA_ARGS__))
 #define JS_FUNC_OBJ_SUPER(super_list, ...)  JS_FUNCTION_CONTAINER_INTERNAL_IMPL(super_list, JS::makeTuple(JS_INTERNAL_MAKE_FUNCTIONS(__VA_ARGS__)))
 #define JS_FUNCTION_CONTAINER_WITH_SUPER(super_list, ...) JS_FUNCTION_CONTAINER_INTERNAL_IMPL(super_list, JS::makeTuple(__VA_ARGS__))
 
@@ -6920,10 +6928,10 @@ struct TypeHandler<float>
 };
 
 /// \private
-template <>
-struct TypeHandler<int>
+template<typename T>
+struct TypeHandlerIntType
 {
-  static inline Error to(int &to_type, ParseContext &context)
+  static inline Error to(T &to_type, ParseContext &context)
   {
     const char *pointer;
     auto parse_error =
@@ -6933,9 +6941,9 @@ struct TypeHandler<int>
     return Error::NoError;
   }
 
-  static inline void from(const int &from_type, Token &token, Serializer &serializer)
+  static inline void from(const T &from_type, Token &token, Serializer &serializer)
   {
-    char buf[11];
+    char buf[40];
     int digits_truncated;
     int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
     if (size <= 0 || digits_truncated)
@@ -6953,333 +6961,61 @@ struct TypeHandler<int>
 
 /// \private
 template <>
-struct TypeHandler<uint32_t>
-{
-public:
-  static inline Error to(uint32_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
+struct TypeHandler<short int> : TypeHandlerIntType<short int> {};
 
-  static void from(const uint32_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[12];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
+/// \private
+template <>
+struct TypeHandler<unsigned short int> : TypeHandlerIntType<unsigned short int> {};
 
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
-};
+/// \private
+template <>
+struct TypeHandler<int> : TypeHandlerIntType<int> {};
 
+/// \private
+template <>
+struct TypeHandler<unsigned int> : TypeHandlerIntType<unsigned int> {};
+
+/// \private
+template <>
+struct TypeHandler<long int> : TypeHandlerIntType<long int> {};
+
+/// \private
+template <>
+struct TypeHandler<unsigned long int> : TypeHandlerIntType<unsigned long int> {};
+
+/// \private
+template <>
+struct TypeHandler<long long int> : TypeHandlerIntType<long long int> {};
+
+/// \private
+template <>
+struct TypeHandler<unsigned long long int> : TypeHandlerIntType<unsigned long long int> {};
 
 #ifdef JS_INT_128
 /// \private
 template <>
-struct TypeHandler<int128_t>
-{
-public:
-  static inline Error to(int128_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static void from(const int128_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[44];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
-};
+struct TypeHandler<int128_t> : TypeHandlerIntType<int128_t> {};
 
 /// \private
 template <>
-struct TypeHandler<uint128_t>
-{
-public:
-  static inline Error to(uint128_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static inline void from(const uint128_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[44];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
-};
+struct TypeHandler<uint128_t> : TypeHandlerIntType<uint128_t> {};
 #endif
 
-/// \private
 template <>
-struct TypeHandler<int64_t>
+struct TypeHandler<uint8_t> : TypeHandlerIntType<uint8_t>
 {
-public:
-  static inline Error to(int64_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static void from(const int64_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[24];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
-};
-
-/// \private
-template <>
-struct TypeHandler<uint64_t>
-{
-public:
-  static inline Error to(uint64_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static inline void from(const uint64_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[24];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
-};
-
-/// \private
-template <>
-struct TypeHandler<int16_t>
-{
-public:
-  static inline Error to(int16_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static inline void from(const int16_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[8];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
-};
-
-/// \private
-template <>
-struct TypeHandler<uint16_t>
-{
-public:
-  static inline Error to(uint16_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static inline void from(const uint16_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[8];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
 };
 
 template <>
-struct TypeHandler<uint8_t>
+struct TypeHandler<int8_t> : TypeHandlerIntType<int8_t>
 {
-public:
-  static inline Error to(uint8_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static inline void from(const uint8_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[8];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
 };
 
 template <>
-struct TypeHandler<int8_t>
+struct TypeHandler<char> : TypeHandlerIntType<char>
 {
-public:
-  static inline Error to(int8_t &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static inline void from(const int8_t &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[8];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
 };
 
-template <>
-struct TypeHandler<char>
-{
-public:
-  static inline Error to(char &to_type, ParseContext &context)
-  {
-    const char *pointer;
-    auto parse_error =
-      Internal::ft::integer::to_integer(context.token.value.data, context.token.value.size, to_type, pointer);
-    if (parse_error != Internal::ft::parse_string_error::ok || context.token.value.data == pointer)
-      return Error::FailedToParseInt;
-    return Error::NoError;
-  }
-
-  static inline void from(const char &from_type, Token &token, Serializer &serializer)
-  {
-    char buf[8];
-    int digits_truncated;
-    int size = Internal::ft::integer::to_buffer(from_type, buf, sizeof(buf), &digits_truncated);
-    if (size <= 0 || digits_truncated)
-    {
-      fprintf(stderr, "error serializing int token\n");
-      return;
-    }
-
-    token.value_type = Type::Number;
-    token.value.data = buf;
-    token.value.size = size_t(size);
-    serializer.write(token);
-  }
-};
 
 /// \private
 template <typename T>
@@ -7490,7 +7226,6 @@ struct TypeHandler<bool>
 template <typename T>
 struct TypeHandler<std::vector<T>>
 {
-public:
   static inline Error to(std::vector<T> &to_type, ParseContext &context)
   {
     if (context.token.value_type != JS::Type::ArrayStart)
@@ -8158,7 +7893,7 @@ struct OneOrMany
 };
 
 template <typename T>
-class TypeHandler<OneOrMany<T>>
+struct TypeHandler<OneOrMany<T>>
 {
 public:
   static inline Error to(OneOrMany<T> &to_type, ParseContext &context)
@@ -8190,7 +7925,7 @@ public:
 };
 
 template <typename T, size_t N>
-class TypeHandler<T[N]>
+struct TypeHandler<T[N]>
 {
 public:
   static inline Error to(T (&to_type)[N], ParseContext &context)
@@ -8230,12 +7965,11 @@ public:
     serializer.write(token);
   }
 };
-#ifdef JS_STD_UNORDERED_MAP
-template <typename Key, typename Value>
-class TypeHandler<std::unordered_map<Key, Value>>
+
+template <typename Key, typename Value, typename Map>
+struct TypeHandlerMap
 {
-public:
-  static inline Error to(std::unordered_map<Key, Value> &to_type, ParseContext &context)
+  static inline Error to(Map &to_type, ParseContext &context)
   {
     if (context.token.value_type != Type::ObjectStart)
     {
@@ -8247,10 +7981,10 @@ public:
       return error;
     while (context.token.value_type != Type::ObjectEnd)
     {
-      Key k(context.token.name.data, context.token.name.size);
+      Key key(context.token.name.data, context.token.name.size);
       Value v;
       error = TypeHandler<Value>::to(v, context);
-      to_type[k] = v;
+      to_type[std::move(key)] = std::move(v);
       if (error != JS::Error::NoError)
         return error;
       error = context.nextToken();
@@ -8259,7 +7993,7 @@ public:
     return error;
   }
 
-  static void from(const std::unordered_map<Key, Value> &from, Token &token, Serializer &serializer)
+  static void from(const Map &from, Token &token, Serializer &serializer)
   {
     token.value_type = Type::ObjectStart;
     token.value = DataRef("{");
@@ -8278,6 +8012,12 @@ public:
     serializer.write(token);
   }
 };
+
+
+#ifdef JS_STD_UNORDERED_MAP
+template <typename Key, typename Value>
+struct TypeHandler<std::unordered_map<Key, Value>> : TypeHandlerMap<Key, Value, std::unordered_map<Key, Value>> {};
+
 #endif
 
 namespace Internal
@@ -8638,5 +8378,85 @@ struct TypeHandler<ArrayVariableContent<T, COUNT>>
     serializer.write(token);
   }
 };
+
+template <typename T, typename Set>
+struct TypeHandlerSet
+{
+  static inline Error to(Set &to_type, ParseContext &context)
+  {
+    if (context.token.value_type != JS::Type::ArrayStart)
+      return Error::ExpectedArrayStart;
+    Error error = context.nextToken();
+    if (error != JS::Error::NoError)
+      return error;
+    to_type.clear();
+    while (context.token.value_type != JS::Type::ArrayEnd)
+    {
+      T t;
+      error = TypeHandler<T>::to(t, context);
+      if (error != JS::Error::NoError)
+        break;
+      auto insert_ret = to_type.insert(std::move(t));
+      if (!insert_ret.second)
+        return JS::Error::DuplicateInSet;
+
+      error = context.nextToken();
+      if (error != JS::Error::NoError)
+        break;
+    }
+
+    return error;
+  }
+
+  static inline void from(const Set &set, Token &token, Serializer &serializer)
+  {
+    token.value_type = Type::ArrayStart;
+    token.value = DataRef("[");
+    serializer.write(token);
+
+    token.name = DataRef("");
+
+    for (auto &index : set)
+    {
+      TypeHandler<T>::from(index, token, serializer);
+    }
+
+    token.name = DataRef("");
+
+    token.value_type = Type::ArrayEnd;
+    token.value = DataRef("]");
+    serializer.write(token);
+  }
+};
 } // namespace JS
 #endif // JSON_STRUCT_H
+
+#if defined(JS_STL_MAP) && !defined(JS_STL_MAP_INCLUDE)
+#define JS_STL_MAP_INCLUDE
+#include <map>
+namespace JS
+{
+template<typename Key, typename Value>
+struct TypeHandler<std::map<Key, Value>> : TypeHandlerMap<Key, Value, std::map<Key, Value>> {};
+}
+#endif
+
+#if defined(JS_STL_SET) && !defined(JS_STL_SET_INCLUDE)
+#define JS_STL_SET_INCLUDE
+#include <set>
+namespace JS
+{
+template<typename Key>
+struct TypeHandler<std::set<Key>> : TypeHandlerSet<Key, std::set<Key>> {};
+}
+#endif
+
+#if defined(JS_STL_UNORDERED_SET) && !defined(JS_STL_UNORDERED_SET_INCLUDE)
+#define JS_STL_UNORDERED_SET_INCLUDE
+#include <unordered_set>
+namespace JS
+{
+template<typename Key>
+struct TypeHandler<std::unordered_set<Key>> : TypeHandlerSet<Key, std::unordered_set<Key>> {};
+}
+#endif
