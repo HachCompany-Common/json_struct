@@ -39,17 +39,18 @@ TEST_CASE("test_optional", "[json_struct]")
 {
   {
     JS::ParseContext context(json);
-    context.allow_unnasigned_required_members = false;
+    context.allow_unasigned_required_members = false;
     SmallStructWithoutOptional data;
-    context.parseTo(data);
-    REQUIRE(context.error != JS::Error::NoError);
+    auto error = context.parseTo(data);
+    REQUIRE(error != JS::Error::NoError);
   }
 #ifdef JS_STD_OPTIONAL
   {
     JS::ParseContext context(json);
-    context.allow_unnasigned_required_members = false;
+    context.allow_unasigned_required_members = false;
     SmallStructStd data;
-    context.parseTo(data);
+    auto error = context.parseTo(data);
+    REQUIRE(error == JS::Error::NoError);
     REQUIRE(context.error == JS::Error::NoError);
     REQUIRE(data.a == 1);
     REQUIRE(data.b.value() > 2.199);
