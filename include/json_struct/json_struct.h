@@ -4524,6 +4524,52 @@ void populateEnumNames(std::vector<DataRef> &names, const char (&data)[N])
   };                                                                                                                   \
   }
 
+#define JS_ENUM_DECLARE_VALUE_PARSER(name)                                                                             \
+  namespace JS                                                                                                         \
+  {                                                                                                                    \
+  template <>                                                                                                          \
+  struct TypeHandler<name>                                                                                             \
+  {                                                                                                                    \
+    typedef std::underlying_type<name>::type utype;                                                                    \
+    static inline Error to(name &to_type, ParseContext &context)                                                       \
+    {                                                                                                                  \
+      utype to_value;                                                                                                  \
+      JS::Error result = TypeHandler<utype>::to(to_value, context);                                                    \
+      if (result == JS::Error::NoError)                                                                                \
+        to_type = static_cast<name>(to_value);                                                                         \
+      return result;                                                                                                   \
+    }                                                                                                                  \
+    static inline void from(const name &from_type, Token &token, Serializer &serializer)                               \
+    {                                                                                                                  \
+        const utype from_value = static_cast<utype>(from_type);                                                        \
+        TypeHandler<utype>::from(from_value, token, serializer);                                                       \
+    }                                                                                                                  \
+  };                                                                                                                   \
+  }
+
+#define JS_ENUM_NAMESPACE_DECLARE_VALUE_PARSER(ns, name)                                                               \
+  namespace JS                                                                                                         \
+  {                                                                                                                    \
+  template <>                                                                                                          \
+  struct TypeHandler<ns::name>                                                                                         \
+  {                                                                                                                    \
+    typedef std::underlying_type<ns::name>::type utype;                                                                \
+    static inline Error to(ns::name &to_type, ParseContext &context)                                                   \
+    {                                                                                                                  \
+      utype to_value;                                                                                                  \
+      JS::Error result = TypeHandler<utype>::to(to_value, context);                                                    \
+      if (result == JS::Error::NoError)                                                                                \
+        to_type = static_cast<ns::name>(to_value);                                                                     \
+      return result;                                                                                                   \
+    }                                                                                                                  \
+    static inline void from(const ns::name &from_type, Token &token, Serializer &serializer)                           \
+    {                                                                                                                  \
+        const utype from_value = static_cast<utype>(from_type);                                                        \
+        TypeHandler<utype>::from(from_value, token, serializer);                                                       \
+    }                                                                                                                  \
+  };                                                                                                                   \
+  }
+
 namespace JS
 {
 template <typename T, typename Enable>
