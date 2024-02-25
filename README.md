@@ -1,6 +1,7 @@
 # **Structurize your JSON**
 
 [![Build status](https://ci.appveyor.com/api/projects/status/mduab0w8u12atfbu?svg=true)](https://ci.appveyor.com/project/jorgen36373/json-struct)
+[![ClusterFuzzLite PR fuzzing](https://github.com/jorgen/json_struct/actions/workflows/cflite_pr.yml/badge.svg)](https://github.com/jorgen/json_struct/actions/workflows/cflite_pr.yml)
 
 json_struct is a single header only library that parses JSON to C++ structs/classes
 and serializing structs/classes to JSON.
@@ -267,3 +268,13 @@ https://github.com/jorgen/json_struct/tree/master/examples
 
 and have a look at the more complete unit tests at:
 https://github.com/jorgen/json_struct/tree/master/tests
+
+
+## SAST Tools
+
+- [PVS-Studio](https://pvs-studio.com/pvs-studio/?utm_source=website&utm_medium=github&utm_campaign=open_source) - static analyzer for C, C++, C#, and Java code.
+
+## DAST Tools
+All tests are run with Clang Address Sanitizer and Memory Sanitizers on pull requests.
+- [Clang Address Sanitizer](https://clang.llvm.org/docs/AddressSanitizer.html)
+- [Clang Memory Sanitizer](https://clang.llvm.org/docs/MemorySanitizer.html)
