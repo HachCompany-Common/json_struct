@@ -184,6 +184,78 @@
 
 #define JS_UNUSED(x) (void)(x)
 
+#ifndef JS_DISABLE_SIMD
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define JSON_STRUCT_HAS_SSE2 1
+#include <emmintrin.h>
+#endif
+
+#if defined(__SSE4_2__) || (defined(_MSC_VER) && defined(__AVX__))
+#define JSON_STRUCT_HAS_SSE4_2 1
+#include <nmmintrin.h>
+#endif
+
+#if defined(__AVX2__)
+#define JSON_STRUCT_HAS_AVX2 1
+#include <immintrin.h>
+#endif
+
+#if defined(__BMI__) || defined(__BMI2__)
+#define JSON_STRUCT_HAS_BMI 1
+#include <immintrin.h>
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#define JSON_STRUCT_HAS_NEON 1
+#include <arm_neon.h>
+#endif
+#endif
+
+
+#if defined(__GNUC__) || defined(__clang__)
+#define JSON_STRUCT_LIKELY(x) __builtin_expect(!!(x), 1)
+#define JSON_STRUCT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define JSON_STRUCT_FORCE_INLINE __attribute__((always_inline)) inline
+#define JSON_STRUCT_COLD __attribute__((cold))
+#define JSON_STRUCT_HOT __attribute__((hot))
+#define JSON_STRUCT_RESTRICT __restrict__
+#elif defined(_MSC_VER)
+#define JSON_STRUCT_LIKELY(x) (x)
+#define JSON_STRUCT_UNLIKELY(x) (x)
+#define JSON_STRUCT_FORCE_INLINE __forceinline
+#define JSON_STRUCT_COLD
+#define JSON_STRUCT_HOT
+#define JSON_STRUCT_RESTRICT __restrict
+#else
+#define JSON_STRUCT_LIKELY(x) (x)
+#define JSON_STRUCT_UNLIKELY(x) (x)
+#define JSON_STRUCT_FORCE_INLINE inline
+#define JSON_STRUCT_COLD
+#define JSON_STRUCT_HOT
+#define JSON_STRUCT_RESTRICT
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define JSON_STRUCT_PREFETCH(ptr) __builtin_prefetch(ptr, 0, 3); __builtin_prefetch((char*)(ptr) + 64, 0, 3)
+#define JSON_STRUCT_PREFETCH_WRITE(ptr) __builtin_prefetch(ptr, 1, 3)
+#elif defined(__GNUC__) || defined(__clang__)
+#define JSON_STRUCT_PREFETCH(ptr) __builtin_prefetch(ptr, 0, 3)
+#define JSON_STRUCT_PREFETCH_WRITE(ptr) __builtin_prefetch(ptr, 1, 3)
+#else
+#define JSON_STRUCT_PREFETCH(ptr) ((void)0)
+#define JSON_STRUCT_PREFETCH_WRITE(ptr) ((void)0)
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define JSON_STRUCT_CACHE_LINE_SIZE 64
+#define JSON_STRUCT_ALIGN_CACHE __attribute__((aligned(JSON_STRUCT_CACHE_LINE_SIZE)))
+#define JSON_STRUCT_MEMORY_BARRIER() __asm__ __volatile__("dsb sy" ::: "memory")
+#else
+#define JSON_STRUCT_CACHE_LINE_SIZE 64
+#define JSON_STRUCT_ALIGN_CACHE __attribute__((aligned(JSON_STRUCT_CACHE_LINE_SIZE)))
+#define JSON_STRUCT_MEMORY_BARRIER() __asm__ __volatile__("" ::: "memory")
+#endif
+
 #ifndef JS
 #define JS JS
 #endif
@@ -314,15 +386,14 @@ enum Lookup
   NumberEnd = 64
 };
 
-static inline const unsigned char *lookup()
-{
-  static const unsigned char tmp[] = {
+// Constexpr lookup table for better compiler optimization
+static constexpr unsigned char lookup_table[256] = {
     /*0*/ 4,        0,       0,       0,       0,       0,       0,       0,
     /*8*/ 0,        4,       4,       0,       0,       4,       0,       0,
     /*16*/ 0,       0,       0,       0,       0,       0,       0,       0,
     /*24*/ 0,       0,       0,       0,       0,       0,       0,       0,
     /*32*/ 4,       0,       1,       0,       0,       0,       0,       0,
-    /*40*/ 0,       0,       0,       8 | 64,  0,       8 | 64,  64,      0,
+    /*40*/ 0,       0,       0,       8 | 64,  0,       8 | 32 | 64,  32 | 64, 32,
     /*48*/ 16 | 64, 16 | 64, 16 | 64, 16 | 64, 16 | 64, 16 | 64, 16 | 64, 16 | 64,
     /*56*/ 16 | 64, 16 | 64, 0,       0,       0,       0,       0,       0,
     /*64*/ 0,       2,       2,       2,       2,       2 | 64,  2,       2,
@@ -349,8 +420,802 @@ static inline const unsigned char *lookup()
     /*232*/ 0,      0,       0,       0,       0,       0,       0,       0,
     /*240*/ 0,      0,       0,       0,       0,       0,       0,       0,
     /*248*/ 0,      0,       0,       0,       0,       0,       0,       0};
-  return tmp;
+
+static inline const unsigned char *lookup()
+{
+  return lookup_table;
 }
+
+#ifdef JSON_STRUCT_HAS_SSE2
+
+static inline int bit_scan_forward(unsigned int mask)
+{
+#ifdef _MSC_VER
+  unsigned long index;
+  _BitScanForward(&index, mask);
+  return int(index);
+#else
+  return __builtin_ctz(mask);
+#endif
+}
+
+inline size_t findStringEndSIMD(const char* JSON_STRUCT_RESTRICT data, size_t length, bool& is_escaped)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const __m128i quote = _mm_set1_epi8('"');
+  const __m128i backslash = _mm_set1_epi8('\\');
+
+  while (current + 16 <= end) {
+    __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current));
+
+    __m128i quote_mask = _mm_cmpeq_epi8(chunk, quote);
+    __m128i backslash_mask = _mm_cmpeq_epi8(chunk, backslash);
+    __m128i combined_mask = _mm_or_si128(quote_mask, backslash_mask);
+
+    int mask = _mm_movemask_epi8(combined_mask);
+    if (JSON_STRUCT_LIKELY(mask != 0)) {
+      int offset = bit_scan_forward(mask);
+      current += offset;
+      break;
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    if (JSON_STRUCT_UNLIKELY(is_escaped)) {
+      is_escaped = false;
+      current++;
+      continue;
+    }
+
+    char c = *current;
+    if (JSON_STRUCT_UNLIKELY(c == '\\')) {
+      is_escaped = true;
+    } else if (c == '"') {
+      return current - data + 1;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t findNumberEndSIMD(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+#ifdef JSON_STRUCT_HAS_SSE4_2
+  const __m128i number_chars = _mm_setr_epi8('0','1','2','3','4','5','6','7','8','9',
+                                            '.','e','E','+','-',0);
+
+  while (current + 16 <= end) {
+    __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current));
+
+    int result = _mm_cmpistri(number_chars, chunk,
+                              _SIDD_CMP_EQUAL_ANY | _SIDD_NEGATIVE_POLARITY);
+
+    if (result != 16) {
+      current += result;
+      break;
+    }
+    current += 16;
+  }
+#endif
+
+  while (current < end) {
+    char c = *current;
+    if (JSON_STRUCT_UNLIKELY(!((c >= '0' && c <= '9') || c == '.' ||
+                               c == 'e' || c == 'E' || c == '+' || c == '-'))) {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+#endif
+
+#ifdef JSON_STRUCT_HAS_NEON
+inline size_t findStringEndNEON(const char* JSON_STRUCT_RESTRICT data, size_t length, bool& is_escaped)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const uint8x16_t quote = vdupq_n_u8('"');
+  const uint8x16_t backslash = vdupq_n_u8('\\');
+
+  while (current + 16 <= end) {
+    uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(current));
+
+    uint8x16_t quote_mask = vceqq_u8(chunk, quote);
+    uint8x16_t backslash_mask = vceqq_u8(chunk, backslash);
+    uint8x16_t combined_mask = vorrq_u8(quote_mask, backslash_mask);
+
+    uint64x2_t combined_u64 = vreinterpretq_u64_u8(combined_mask);
+    uint64_t combined_scalar = vgetq_lane_u64(combined_u64, 0) | vgetq_lane_u64(combined_u64, 1);
+
+    if (JSON_STRUCT_LIKELY(combined_scalar != 0)) {
+      uint32x4_t mask_u32 = vreinterpretq_u32_u8(combined_mask);
+      uint32_t mask_bits[4];
+      vst1q_u32(mask_bits, mask_u32);
+
+      for (int i = 0; i < 4; i++) {
+        if (mask_bits[i] != 0) {
+          for (int j = 0; j < 4; j++) {
+            if ((mask_bits[i] >> (j * 8)) & 0xFF) {
+              current += i * 4 + j;
+              goto byte_by_byte;
+            }
+          }
+        }
+      }
+    }
+    current += 16;
+  }
+
+byte_by_byte:
+  while (current < end) {
+    if (JSON_STRUCT_UNLIKELY(is_escaped)) {
+      is_escaped = false;
+      current++;
+      continue;
+    }
+
+    char c = *current;
+    if (JSON_STRUCT_UNLIKELY(c == '\\')) {
+      is_escaped = true;
+    } else if (c == '"') {
+      return current - data + 1;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t findNumberEndNEON(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const uint8x16_t zero = vdupq_n_u8('0');
+  const uint8x16_t nine = vdupq_n_u8('9');
+  const uint8x16_t dot = vdupq_n_u8('.');
+  const uint8x16_t plus = vdupq_n_u8('+');
+  const uint8x16_t minus = vdupq_n_u8('-');
+  const uint8x16_t e_lower = vdupq_n_u8('e');
+  const uint8x16_t e_upper = vdupq_n_u8('E');
+
+  while (current + 16 <= end) {
+    uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(current));
+
+    uint8x16_t ge_zero = vcgeq_u8(chunk, zero);
+    uint8x16_t le_nine = vcleq_u8(chunk, nine);
+    uint8x16_t digits = vandq_u8(ge_zero, le_nine);
+
+    uint8x16_t is_dot = vceqq_u8(chunk, dot);
+    uint8x16_t is_plus = vceqq_u8(chunk, plus);
+    uint8x16_t is_minus = vceqq_u8(chunk, minus);
+    uint8x16_t is_e_lower = vceqq_u8(chunk, e_lower);
+    uint8x16_t is_e_upper = vceqq_u8(chunk, e_upper);
+
+    uint8x16_t valid_chars = vorrq_u8(digits, is_dot);
+    valid_chars = vorrq_u8(valid_chars, is_plus);
+    valid_chars = vorrq_u8(valid_chars, is_minus);
+    valid_chars = vorrq_u8(valid_chars, is_e_lower);
+    valid_chars = vorrq_u8(valid_chars, is_e_upper);
+
+    uint8x16_t invalid_chars = vmvnq_u8(valid_chars);
+
+    uint64x2_t invalid_u64 = vreinterpretq_u64_u8(invalid_chars);
+    uint64_t invalid_scalar = vgetq_lane_u64(invalid_u64, 0) | vgetq_lane_u64(invalid_u64, 1);
+
+    if (JSON_STRUCT_LIKELY(invalid_scalar != 0)) {
+      uint32x4_t invalid_u32 = vreinterpretq_u32_u8(invalid_chars);
+      uint32_t invalid_bits[4];
+      vst1q_u32(invalid_bits, invalid_u32);
+
+      for (int i = 0; i < 4; i++) {
+        if (invalid_bits[i] != 0) {
+          for (int j = 0; j < 4; j++) {
+            if ((invalid_bits[i] >> (j * 8)) & 0xFF) {
+              current += i * 4 + j;
+              return current - data;
+            }
+          }
+        }
+      }
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    char c = *current;
+    if (JSON_STRUCT_UNLIKELY(!((c >= '0' && c <= '9') || c == '.' ||
+                               c == 'e' || c == 'E' || c == '+' || c == '-'))) {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t skipWhitespaceNEON(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const uint8x16_t space = vdupq_n_u8(' ');
+  const uint8x16_t tab = vdupq_n_u8('\t');
+  const uint8x16_t newline = vdupq_n_u8('\n');
+  const uint8x16_t carriage = vdupq_n_u8('\r');
+
+  while (current + 16 <= end) {
+    uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(current));
+
+    uint8x16_t is_space = vceqq_u8(chunk, space);
+    uint8x16_t is_tab = vceqq_u8(chunk, tab);
+    uint8x16_t is_newline = vceqq_u8(chunk, newline);
+    uint8x16_t is_carriage = vceqq_u8(chunk, carriage);
+
+    uint8x16_t whitespace = vorrq_u8(is_space, is_tab);
+    whitespace = vorrq_u8(whitespace, is_newline);
+    whitespace = vorrq_u8(whitespace, is_carriage);
+
+    uint8x16_t non_whitespace = vmvnq_u8(whitespace);
+
+    uint64x2_t non_ws_u64 = vreinterpretq_u64_u8(non_whitespace);
+    uint64_t non_ws_scalar = vgetq_lane_u64(non_ws_u64, 0) | vgetq_lane_u64(non_ws_u64, 1);
+
+    if (JSON_STRUCT_LIKELY(non_ws_scalar != 0)) {
+      uint32x4_t non_ws_u32 = vreinterpretq_u32_u8(non_whitespace);
+      uint32_t non_ws_bits[4];
+      vst1q_u32(non_ws_bits, non_ws_u32);
+
+      for (int i = 0; i < 4; i++) {
+        if (non_ws_bits[i] != 0) {
+          for (int j = 0; j < 4; j++) {
+            if ((non_ws_bits[i] >> (j * 8)) & 0xFF) {
+              current += i * 4 + j;
+              return current - data;
+            }
+          }
+        }
+      }
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    char c = *current;
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t findAsciiEndNEON(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const uint8x16_t char_A = vdupq_n_u8('A');
+  const uint8x16_t char_Z = vdupq_n_u8('Z');
+  const uint8x16_t char_a = vdupq_n_u8('a');
+  const uint8x16_t char_z = vdupq_n_u8('z');
+  const uint8x16_t char_0 = vdupq_n_u8('0');
+  const uint8x16_t char_9 = vdupq_n_u8('9');
+  const uint8x16_t char_underscore = vdupq_n_u8('_');
+  const uint8x16_t char_caret = vdupq_n_u8('^');
+  const uint8x16_t char_apostrophe = vdupq_n_u8('`');
+  const uint8x16_t char_slash = vdupq_n_u8('/');
+  const uint8x16_t char_dot = vdupq_n_u8('.');
+  const uint8x16_t char_hyphen = vdupq_n_u8('-');
+
+  while (current + 16 <= end) {
+    uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(current));
+
+    // Check A-Z
+    uint8x16_t ge_A = vcgeq_u8(chunk, char_A);
+    uint8x16_t le_Z = vcleq_u8(chunk, char_Z);
+    uint8x16_t is_upper = vandq_u8(ge_A, le_Z);
+
+    // Check a-z
+    uint8x16_t ge_a = vcgeq_u8(chunk, char_a);
+    uint8x16_t le_z = vcleq_u8(chunk, char_z);
+    uint8x16_t is_lower = vandq_u8(ge_a, le_z);
+
+    // Check 0-9
+    uint8x16_t ge_0 = vcgeq_u8(chunk, char_0);
+    uint8x16_t le_9 = vcleq_u8(chunk, char_9);
+    uint8x16_t is_digit = vandq_u8(ge_0, le_9);
+
+    // Check special chars: _, ^, `, /, ., -
+    uint8x16_t is_underscore = vceqq_u8(chunk, char_underscore);
+    uint8x16_t is_caret = vceqq_u8(chunk, char_caret);
+    uint8x16_t is_apostrophe = vceqq_u8(chunk, char_apostrophe);
+    uint8x16_t is_slash = vceqq_u8(chunk, char_slash);
+    uint8x16_t is_dot = vceqq_u8(chunk, char_dot);
+    uint8x16_t is_hyphen = vceqq_u8(chunk, char_hyphen);
+
+    // Combine all valid characters
+    uint8x16_t valid_chars = vorrq_u8(is_upper, is_lower);
+    valid_chars = vorrq_u8(valid_chars, is_digit);
+    valid_chars = vorrq_u8(valid_chars, is_underscore);
+    valid_chars = vorrq_u8(valid_chars, is_caret);
+    valid_chars = vorrq_u8(valid_chars, is_apostrophe);
+    valid_chars = vorrq_u8(valid_chars, is_slash);
+    valid_chars = vorrq_u8(valid_chars, is_dot);
+    valid_chars = vorrq_u8(valid_chars, is_hyphen);
+
+    // Find invalid characters
+    uint8x16_t invalid_chars = vmvnq_u8(valid_chars);
+
+    uint64x2_t invalid_u64 = vreinterpretq_u64_u8(invalid_chars);
+    uint64_t invalid_scalar = vgetq_lane_u64(invalid_u64, 0) | vgetq_lane_u64(invalid_u64, 1);
+
+    if (JSON_STRUCT_LIKELY(invalid_scalar != 0)) {
+      uint32x4_t invalid_u32 = vreinterpretq_u32_u8(invalid_chars);
+      uint32_t invalid_bits[4];
+      vst1q_u32(invalid_bits, invalid_u32);
+
+      for (int i = 0; i < 4; i++) {
+        if (invalid_bits[i] != 0) {
+          for (int j = 0; j < 4; j++) {
+            if ((invalid_bits[i] >> (j * 8)) & 0xFF) {
+              current += i * 4 + j;
+              return current - data;
+            }
+          }
+        }
+      }
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    char c = *current;
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '^' || c == '`' || c == '/' || c == '.' || c == '-')) {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t skipCommentNEON(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+  const uint8x16_t newline = vdupq_n_u8('\n');
+
+  while (current + 16 <= end) {
+    uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(current));
+    uint8x16_t is_newline = vceqq_u8(chunk, newline);
+
+    uint64x2_t newline_u64 = vreinterpretq_u64_u8(is_newline);
+    uint64_t newline_scalar = vgetq_lane_u64(newline_u64, 0) | vgetq_lane_u64(newline_u64, 1);
+
+    if (JSON_STRUCT_LIKELY(newline_scalar != 0)) {
+      uint32x4_t newline_u32 = vreinterpretq_u32_u8(is_newline);
+      uint32_t newline_bits[4];
+      vst1q_u32(newline_bits, newline_u32);
+
+      for (int i = 0; i < 4; i++) {
+        if (newline_bits[i] != 0) {
+          for (int j = 0; j < 4; j++) {
+            if ((newline_bits[i] >> (j * 8)) & 0xFF) {
+              current += i * 4 + j;
+              return current - data + 1;
+            }
+          }
+        }
+      }
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    if (*current == '\n') {
+      return current - data + 1;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+#endif
+
+#ifdef JSON_STRUCT_HAS_SSE2
+
+inline size_t findAsciiEndSIMD(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const __m128i char_A = _mm_set1_epi8('A');
+  const __m128i char_Z = _mm_set1_epi8('Z');
+  const __m128i char_a = _mm_set1_epi8('a');
+  const __m128i char_z = _mm_set1_epi8('z');
+  const __m128i char_0 = _mm_set1_epi8('0');
+  const __m128i char_9 = _mm_set1_epi8('9');
+  const __m128i char_underscore = _mm_set1_epi8('_');
+  const __m128i char_caret = _mm_set1_epi8('^');
+  const __m128i char_apostrophe = _mm_set1_epi8('`');
+  const __m128i char_slash = _mm_set1_epi8('/');
+  const __m128i char_dot = _mm_set1_epi8('.');
+  const __m128i char_hyphen = _mm_set1_epi8('-');
+
+  while (current + 16 <= end) {
+    __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current));
+
+    // Check A-Z (unsigned comparison)
+    __m128i ge_A = _mm_cmpeq_epi8(_mm_max_epu8(chunk, char_A), chunk);
+    __m128i le_Z = _mm_cmpeq_epi8(_mm_min_epu8(chunk, char_Z), chunk);
+    __m128i is_upper = _mm_and_si128(ge_A, le_Z);
+
+    // Check a-z
+    __m128i ge_a = _mm_cmpeq_epi8(_mm_max_epu8(chunk, char_a), chunk);
+    __m128i le_z = _mm_cmpeq_epi8(_mm_min_epu8(chunk, char_z), chunk);
+    __m128i is_lower = _mm_and_si128(ge_a, le_z);
+
+    // Check 0-9
+    __m128i ge_0 = _mm_cmpeq_epi8(_mm_max_epu8(chunk, char_0), chunk);
+    __m128i le_9 = _mm_cmpeq_epi8(_mm_min_epu8(chunk, char_9), chunk);
+    __m128i is_digit = _mm_and_si128(ge_0, le_9);
+
+    // Check special chars: _, ^, `, /, ., -
+    __m128i is_underscore = _mm_cmpeq_epi8(chunk, char_underscore);
+    __m128i is_caret = _mm_cmpeq_epi8(chunk, char_caret);
+    __m128i is_apostrophe = _mm_cmpeq_epi8(chunk, char_apostrophe);
+    __m128i is_slash = _mm_cmpeq_epi8(chunk, char_slash);
+    __m128i is_dot = _mm_cmpeq_epi8(chunk, char_dot);
+    __m128i is_hyphen = _mm_cmpeq_epi8(chunk, char_hyphen);
+
+    // Combine all valid characters
+    __m128i valid_chars = _mm_or_si128(is_upper, is_lower);
+    valid_chars = _mm_or_si128(valid_chars, is_digit);
+    valid_chars = _mm_or_si128(valid_chars, is_underscore);
+    valid_chars = _mm_or_si128(valid_chars, is_caret);
+    valid_chars = _mm_or_si128(valid_chars, is_apostrophe);
+    valid_chars = _mm_or_si128(valid_chars, is_slash);
+    valid_chars = _mm_or_si128(valid_chars, is_dot);
+    valid_chars = _mm_or_si128(valid_chars, is_hyphen);
+
+    int mask = _mm_movemask_epi8(valid_chars);
+
+    if (JSON_STRUCT_LIKELY(mask != 0xFFFF)) {
+      mask = ~mask & 0xFFFF;
+      int offset = bit_scan_forward(mask);
+      current += offset;
+      return current - data;
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    char c = *current;
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '^' || c == '`' || c == '/' || c == '.' || c == '-')) {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t skipCommentSIMD(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+  const __m128i newline = _mm_set1_epi8('\n');
+
+  while (current + 16 <= end) {
+    __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current));
+    __m128i cmp = _mm_cmpeq_epi8(chunk, newline);
+    int mask = _mm_movemask_epi8(cmp);
+
+    if (JSON_STRUCT_LIKELY(mask != 0)) {
+      int offset = bit_scan_forward(mask);
+      current += offset;
+      return current - data + 1;
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    if (*current == '\n') {
+      return current - data + 1;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t skipWhitespaceSIMD(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const __m128i space = _mm_set1_epi8(' ');
+  const __m128i tab = _mm_set1_epi8('\t');
+  const __m128i newline = _mm_set1_epi8('\n');
+  const __m128i carriage = _mm_set1_epi8('\r');
+
+  while (current + 16 <= end) {
+    __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(current));
+
+    __m128i is_space = _mm_cmpeq_epi8(chunk, space);
+    __m128i is_tab = _mm_cmpeq_epi8(chunk, tab);
+    __m128i is_newline = _mm_cmpeq_epi8(chunk, newline);
+    __m128i is_carriage = _mm_cmpeq_epi8(chunk, carriage);
+
+    __m128i whitespace = _mm_or_si128(is_space, is_tab);
+    whitespace = _mm_or_si128(whitespace, is_newline);
+    whitespace = _mm_or_si128(whitespace, is_carriage);
+
+    int mask = _mm_movemask_epi8(whitespace);
+
+    if (JSON_STRUCT_LIKELY(mask != 0xFFFF)) {
+      mask = ~mask & 0xFFFF;
+      int offset = bit_scan_forward(mask);
+      current += offset;
+      return current - data;
+    }
+    current += 16;
+  }
+
+  while (current < end) {
+    char c = *current;
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+#endif
+
+#ifdef JSON_STRUCT_HAS_AVX2
+
+inline size_t skipWhitespaceAVX2(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const __m256i space = _mm256_set1_epi8(' ');
+  const __m256i tab = _mm256_set1_epi8('\t');
+  const __m256i newline = _mm256_set1_epi8('\n');
+  const __m256i carriage = _mm256_set1_epi8('\r');
+
+  while (current + 32 <= end) {
+    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current));
+
+    __m256i is_space = _mm256_cmpeq_epi8(chunk, space);
+    __m256i is_tab = _mm256_cmpeq_epi8(chunk, tab);
+    __m256i is_newline = _mm256_cmpeq_epi8(chunk, newline);
+    __m256i is_carriage = _mm256_cmpeq_epi8(chunk, carriage);
+
+    __m256i whitespace = _mm256_or_si256(is_space, is_tab);
+    whitespace = _mm256_or_si256(whitespace, is_newline);
+    whitespace = _mm256_or_si256(whitespace, is_carriage);
+
+    int mask = _mm256_movemask_epi8(whitespace);
+
+    if (JSON_STRUCT_LIKELY(mask != 0xFFFFFFFF)) {
+#ifdef JSON_STRUCT_HAS_BMI
+      int offset = _tzcnt_u32(~mask);
+#else
+      mask = ~mask;
+      int offset = 0;
+      while ((mask & 1) == 0) {
+        mask >>= 1;
+        offset++;
+      }
+#endif
+      current += offset;
+      return current - data;
+    }
+    current += 32;
+  }
+
+  // Fallback for remaining bytes
+  while (current < end) {
+    char c = *current;
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t skipCommentAVX2(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+  const __m256i newline = _mm256_set1_epi8('\n');
+
+  while (current + 32 <= end) {
+    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current));
+    __m256i cmp = _mm256_cmpeq_epi8(chunk, newline);
+    int mask = _mm256_movemask_epi8(cmp);
+
+    if (JSON_STRUCT_LIKELY(mask != 0)) {
+#ifdef JSON_STRUCT_HAS_BMI
+      int offset = _tzcnt_u32(mask);
+#else
+      int offset = 0;
+      while ((mask & (1 << offset)) == 0) {
+        offset++;
+      }
+#endif
+      current += offset;
+      return current - data + 1;
+    }
+    current += 32;
+  }
+
+  while (current < end) {
+    if (*current == '\n') {
+      return current - data + 1;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t findStringEndAVX2(const char* JSON_STRUCT_RESTRICT data, size_t length, bool& is_escaped)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const __m256i quote = _mm256_set1_epi8('"');
+  const __m256i backslash = _mm256_set1_epi8('\\');
+
+  while (current + 32 <= end) {
+    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current));
+
+    __m256i quote_mask = _mm256_cmpeq_epi8(chunk, quote);
+    __m256i backslash_mask = _mm256_cmpeq_epi8(chunk, backslash);
+    __m256i combined_mask = _mm256_or_si256(quote_mask, backslash_mask);
+
+    int mask = _mm256_movemask_epi8(combined_mask);
+    if (JSON_STRUCT_LIKELY(mask != 0)) {
+#ifdef JSON_STRUCT_HAS_BMI
+      int offset = _tzcnt_u32(mask);
+#else
+      int offset = 0;
+      while ((mask & (1 << offset)) == 0) {
+        offset++;
+      }
+#endif
+      current += offset;
+      break;
+    }
+    current += 32;
+  }
+
+  // Handle escapes and final quote
+  while (current < end) {
+    if (JSON_STRUCT_UNLIKELY(is_escaped)) {
+      is_escaped = false;
+      current++;
+      continue;
+    }
+
+    char c = *current;
+    if (JSON_STRUCT_UNLIKELY(c == '\\')) {
+      is_escaped = true;
+    } else if (c == '"') {
+      return current - data + 1;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+inline size_t findAsciiEndAVX2(const char* JSON_STRUCT_RESTRICT data, size_t length)
+{
+  const char* current = data;
+  const char* end = data + length;
+
+  const __m256i char_A = _mm256_set1_epi8('A');
+  const __m256i char_Z = _mm256_set1_epi8('Z');
+  const __m256i char_a = _mm256_set1_epi8('a');
+  const __m256i char_z = _mm256_set1_epi8('z');
+  const __m256i char_0 = _mm256_set1_epi8('0');
+  const __m256i char_9 = _mm256_set1_epi8('9');
+  const __m256i char_underscore = _mm256_set1_epi8('_');
+  const __m256i char_caret = _mm256_set1_epi8('^');
+  const __m256i char_apostrophe = _mm256_set1_epi8('`');
+  const __m256i char_slash = _mm256_set1_epi8('/');
+  const __m256i char_dot = _mm256_set1_epi8('.');
+  const __m256i char_hyphen = _mm256_set1_epi8('-');
+
+  while (current + 32 <= end) {
+    __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(current));
+
+    // Check A-Z using unsigned comparison
+    __m256i ge_A = _mm256_cmpeq_epi8(_mm256_max_epu8(chunk, char_A), chunk);
+    __m256i le_Z = _mm256_cmpeq_epi8(_mm256_min_epu8(chunk, char_Z), chunk);
+    __m256i is_upper = _mm256_and_si256(ge_A, le_Z);
+
+    // Check a-z
+    __m256i ge_a = _mm256_cmpeq_epi8(_mm256_max_epu8(chunk, char_a), chunk);
+    __m256i le_z = _mm256_cmpeq_epi8(_mm256_min_epu8(chunk, char_z), chunk);
+    __m256i is_lower = _mm256_and_si256(ge_a, le_z);
+
+    // Check 0-9
+    __m256i ge_0 = _mm256_cmpeq_epi8(_mm256_max_epu8(chunk, char_0), chunk);
+    __m256i le_9 = _mm256_cmpeq_epi8(_mm256_min_epu8(chunk, char_9), chunk);
+    __m256i is_digit = _mm256_and_si256(ge_0, le_9);
+
+    // Check special chars: _, ^, `, /, ., -
+    __m256i is_underscore = _mm256_cmpeq_epi8(chunk, char_underscore);
+    __m256i is_caret = _mm256_cmpeq_epi8(chunk, char_caret);
+    __m256i is_apostrophe = _mm256_cmpeq_epi8(chunk, char_apostrophe);
+    __m256i is_slash = _mm256_cmpeq_epi8(chunk, char_slash);
+    __m256i is_dot = _mm256_cmpeq_epi8(chunk, char_dot);
+    __m256i is_hyphen = _mm256_cmpeq_epi8(chunk, char_hyphen);
+
+    // Combine all valid characters
+    __m256i valid_chars = _mm256_or_si256(is_upper, is_lower);
+    valid_chars = _mm256_or_si256(valid_chars, is_digit);
+    valid_chars = _mm256_or_si256(valid_chars, is_underscore);
+    valid_chars = _mm256_or_si256(valid_chars, is_caret);
+    valid_chars = _mm256_or_si256(valid_chars, is_apostrophe);
+    valid_chars = _mm256_or_si256(valid_chars, is_slash);
+    valid_chars = _mm256_or_si256(valid_chars, is_dot);
+    valid_chars = _mm256_or_si256(valid_chars, is_hyphen);
+
+    int mask = _mm256_movemask_epi8(valid_chars);
+
+    if (JSON_STRUCT_LIKELY(mask != 0xFFFFFFFF)) {
+#ifdef JSON_STRUCT_HAS_BMI
+      int offset = _tzcnt_u32(~mask);
+#else
+      mask = ~mask;
+      int offset = 0;
+      while ((mask & (1 << offset)) == 0) {
+        offset++;
+      }
+#endif
+      current += offset;
+      return current - data;
+    }
+    current += 32;
+  }
+
+  while (current < end) {
+    char c = *current;
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '^' || c == '`' || c == '/' || c == '.' || c == '-')) {
+      break;
+    }
+    current++;
+  }
+
+  return current - data;
+}
+
+#endif
+
 } // namespace Internal
 
 enum class Error : unsigned char
@@ -440,6 +1305,7 @@ public:
   void allowAsciiType(bool allow);
   void allowNewLineAsTokenDelimiter(bool allow);
   void allowSuperfluousComma(bool allow);
+  void allowComments(bool allow);
 
   void addData(const char *data, size_t size);
   template <size_t N>
@@ -493,20 +1359,22 @@ private:
   Error findStartOfNextValue(Type *type, const DataRef &json_data, size_t *chars_ahead);
   Error findDelimiter(const DataRef &json_data, size_t *chars_ahead);
   Error findTokenEnd(const DataRef &json_data, size_t *chars_ahead);
+  Error skipComment(const DataRef &json_data, size_t *chars_ahead);
   void requestMoreData();
   void releaseFirstDataRef();
   Error populateFromDataRef(DataRef &data, Type &type, const DataRef &json_data);
-  static void populate_annonymous_token(const DataRef &data, Type type, Token &token);
+  static void populate_anonymous_token(const DataRef &data, Type type, Token &token);
   Error populateNextTokenFromDataRef(Token &next_token, const DataRef &json_data);
 
   InTokenState token_state = InTokenState::FindingName;
   InPropertyState property_state = InPropertyState::NoStartFound;
   Type property_type = Type::Error;
-  bool is_escaped : 1;
+  bool is_escaped;
   bool allow_ascii_properties : 1;
   bool allow_new_lines : 1;
   bool allow_superfluous_comma : 1;
-  bool expecting_prop_or_annonymous_data : 1;
+  bool allow_comments : 1;
+  bool expecting_prop_or_anonymous_data : 1;
   bool continue_after_need_more_data : 1;
   size_t cursor_index;
   size_t current_data_start;
@@ -663,7 +1531,8 @@ inline Tokenizer::Tokenizer()
   , allow_ascii_properties(false)
   , allow_new_lines(false)
   , allow_superfluous_comma(false)
-  , expecting_prop_or_annonymous_data(false)
+  , allow_comments(false)
+  , expecting_prop_or_anonymous_data(false)
   , continue_after_need_more_data(false)
   , cursor_index(0)
   , current_data_start(0)
@@ -672,7 +1541,12 @@ inline Tokenizer::Tokenizer()
   , range_context(38)
   , parsed_data_vector(nullptr)
 {
-  container_stack.reserve(16);
+  // Reserve capacity based on typical JSON nesting depth
+  // Most JSON has < 8 levels of nesting, but we reserve for 32 to avoid reallocation
+  container_stack.reserve(32);
+  data_list.reserve(4);
+  copy_buffers.reserve(8);
+  scope_counter.reserve(32);
 }
 
 inline void Tokenizer::allowAsciiType(bool allow)
@@ -688,6 +1562,11 @@ inline void Tokenizer::allowNewLineAsTokenDelimiter(bool allow)
 inline void Tokenizer::allowSuperfluousComma(bool allow)
 {
   allow_superfluous_comma = allow;
+}
+
+inline void Tokenizer::allowComments(bool allow)
+{
+  allow_comments = allow;
 }
 inline void Tokenizer::addData(const char *data, size_t data_size)
 {
@@ -771,31 +1650,31 @@ inline Error Tokenizer::nextToken(Token &next_token)
       scope_counter.back().handleType(next_token.value_type);
     return Error::NoError;
   }
-  if (data_list.empty())
+  if (JSON_STRUCT_UNLIKELY(data_list.empty()))
   {
     requestMoreData();
   }
 
   error_context.clear();
 
-  if (data_list.empty())
+  if (JSON_STRUCT_UNLIKELY(data_list.empty()))
   {
     return Error::NeedMoreData;
   }
 
-  if (!continue_after_need_more_data)
+  if (JSON_STRUCT_LIKELY(!continue_after_need_more_data))
     resetForNewToken();
 
   Error error = Error::NeedMoreData;
-  while (error == Error::NeedMoreData && data_list.size())
+  while (JSON_STRUCT_LIKELY(error == Error::NeedMoreData && data_list.size()))
   {
     const DataRef &json_data = data_list.front();
     error = populateNextTokenFromDataRef(next_token, json_data);
 
-    if (error != Error::NoError && error != Error::NeedMoreData)
+    if (JSON_STRUCT_UNLIKELY(error != Error::NoError && error != Error::NeedMoreData))
       updateErrorContext(error);
 
-    if (error == Error::NeedMoreData)
+    if (JSON_STRUCT_UNLIKELY(error == Error::NeedMoreData))
     {
       releaseFirstDataRef();
       requestMoreData();
@@ -803,13 +1682,13 @@ inline Error Tokenizer::nextToken(Token &next_token)
   }
 
   continue_after_need_more_data = error == Error::NeedMoreData;
-  if (error == JS::Error::NoError)
+  if (JSON_STRUCT_LIKELY(error == JS::Error::NoError))
   {
     if (next_token.value_type == Type::ArrayStart || next_token.value_type == Type::ObjectStart)
       container_stack.push_back(next_token.value_type);
-    if (next_token.value_type == Type::ArrayEnd)
+    if (JSON_STRUCT_UNLIKELY(next_token.value_type == Type::ArrayEnd))
     {
-      if (!container_stack.size() || container_stack.back() != JS::Type::ArrayStart)
+      if (JSON_STRUCT_UNLIKELY(!container_stack.size() || container_stack.back() != JS::Type::ArrayStart))
       {
         error = Error::UnexpectedArrayEnd;
         updateErrorContext(error);
@@ -817,9 +1696,9 @@ inline Error Tokenizer::nextToken(Token &next_token)
       }
       container_stack.pop_back();
     }
-    if (next_token.value_type == Type::ObjectEnd)
+    if (JSON_STRUCT_UNLIKELY(next_token.value_type == Type::ObjectEnd))
     {
-      if (!container_stack.size() || container_stack.back() != JS::Type::ObjectStart)
+      if (JSON_STRUCT_UNLIKELY(!container_stack.size() || container_stack.back() != JS::Type::ObjectStart))
       {
         error = Error::UnexpectedObjectEnd;
         updateErrorContext(error);
@@ -827,7 +1706,7 @@ inline Error Tokenizer::nextToken(Token &next_token)
       }
       container_stack.pop_back();
     }
-    if (scope_counter.size())
+    if (JSON_STRUCT_LIKELY(scope_counter.size()))
       scope_counter.back().handleType(next_token.value_type);
   }
   return error;
@@ -854,20 +1733,18 @@ static bool isValueInIntermediateToken(const Token &token, const Internal::Inter
 
 inline void Tokenizer::copyFromValue(const Token &token, std::string &to_buffer)
 {
-  if (isValueInIntermediateToken(token, intermediate_token))
+  if (JSON_STRUCT_UNLIKELY(isValueInIntermediateToken(token, intermediate_token)))
   {
-    std::string data(token.value.data, token.value.size);
-    to_buffer += data;
-    auto pair = std::make_pair(cursor_index, &to_buffer);
-    copy_buffers.push_back(pair);
+    to_buffer.reserve(to_buffer.size() + token.value.size);
+    to_buffer.append(token.value.data, token.value.size);
+    copy_buffers.emplace_back(cursor_index, &to_buffer);
   }
   else
   {
     assert(token.value.data >= data_list.front().data &&
            token.value.data < data_list.front().data + data_list.front().size);
     ptrdiff_t index = token.value.data - data_list.front().data;
-    auto pair = std::make_pair(index, &to_buffer);
-    copy_buffers.push_back(pair);
+    copy_buffers.emplace_back(index, &to_buffer);
   }
 }
 
@@ -942,7 +1819,7 @@ static const char *error_strings[] = {
 };
 }
 
-inline std::string Tokenizer::makeErrorString() const
+JSON_STRUCT_COLD inline std::string Tokenizer::makeErrorString() const
 {
   static_assert(sizeof(Internal::error_strings) / sizeof *Internal::error_strings ==
                   size_t(Error::UserDefinedErrors) + 1,
@@ -974,54 +1851,80 @@ inline void Tokenizer::setErrorContextConfig(size_t lineContext, size_t rangeCon
   range_context = rangeContext;
 }
 
-inline void Tokenizer::resetForNewToken()
+JSON_STRUCT_FORCE_INLINE void Tokenizer::resetForNewToken()
 {
   intermediate_token.clear();
   resetForNewValue();
 }
 
-inline void Tokenizer::resetForNewValue()
+JSON_STRUCT_FORCE_INLINE void Tokenizer::resetForNewValue()
 {
   property_state = InPropertyState::NoStartFound;
   property_type = Type::Error;
   current_data_start = 0;
 }
 
-inline Error Tokenizer::findStringEnd(const DataRef &json_data, size_t *chars_ahead)
+JSON_STRUCT_FORCE_INLINE Error Tokenizer::findStringEnd(const DataRef &json_data, size_t *chars_ahead)
 {
+#ifdef JSON_STRUCT_HAS_AVX2
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 32)) {
+    size_t consumed = Internal::findStringEndAVX2(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index,
+      is_escaped);
+    if (consumed < json_data.size - cursor_index) {
+      *chars_ahead = consumed;
+      return Error::NoError;
+    }
+  }
+#elif defined(JSON_STRUCT_HAS_NEON)
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16)) {
+    size_t consumed = Internal::findStringEndNEON( json_data.data + cursor_index, json_data.size - cursor_index, is_escaped);
+    if (consumed < json_data.size - cursor_index) {
+      *chars_ahead = consumed;
+      return Error::NoError;
+    }
+  }
+#elif defined(JSON_STRUCT_HAS_SSE2)
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16)) {
+    size_t consumed = Internal::findStringEndSIMD(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index,
+      is_escaped);
+
+    if (consumed < json_data.size - cursor_index) {
+      *chars_ahead = consumed;
+      return Error::NoError;
+    }
+  }
+#endif
+
   size_t end = cursor_index;
-  while (end < json_data.size)
+  JSON_STRUCT_PREFETCH(json_data.data + end + 64);
+
+  while (JSON_STRUCT_LIKELY(end < json_data.size))
   {
-    if (is_escaped)
+    if (JSON_STRUCT_UNLIKELY(is_escaped))
     {
       is_escaped = false;
       end++;
       continue;
     }
-    while (end + 4 < json_data.size)
-    {
-      unsigned char lc = Internal::lookup()[(unsigned char)json_data.data[end]];
-      if (lc == Internal::StrEndOrBackSlash)
-        break;
-      lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-      if (lc == Internal::StrEndOrBackSlash)
-        break;
-      lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-      if (lc == Internal::StrEndOrBackSlash)
-        break;
-      lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-      if (lc == Internal::StrEndOrBackSlash)
-        break;
-      end++;
-    }
-    if (end >= json_data.size)
+
+    const char* search_start = json_data.data + end;
+    const char* search_end = json_data.data + json_data.size;
+    const char* found = std::find_if(search_start, search_end, [](char c) {
+      return Internal::lookup()[(unsigned char)c] == Internal::StrEndOrBackSlash;
+    });
+    end = found - json_data.data;
+    if (JSON_STRUCT_UNLIKELY(end >= json_data.size))
       break;
     char c = json_data.data[end];
-    if (c == '\\')
+    if (JSON_STRUCT_UNLIKELY(c == '\\'))
     {
       is_escaped = true;
     }
-    else if (c == '"')
+    else if (JSON_STRUCT_LIKELY(c == '"'))
     {
       *chars_ahead = end + 1 - cursor_index;
       return Error::NoError;
@@ -1031,28 +1934,51 @@ inline Error Tokenizer::findStringEnd(const DataRef &json_data, size_t *chars_ah
   return Error::NeedMoreData;
 }
 
-inline Error Tokenizer::findAsciiEnd(const DataRef &json_data, size_t *chars_ahead)
+JSON_STRUCT_FORCE_INLINE Error Tokenizer::findAsciiEnd(const DataRef &json_data, size_t *chars_ahead)
 {
   assert(property_type == Type::Ascii);
   size_t end = cursor_index;
-  while (end < json_data.size)
-  {
-    while (end + 4 < json_data.size)
-    {
-      unsigned char lc = Internal::lookup()[(unsigned char)json_data.data[end]];
-      if (!(lc & (Internal::AsciiLetters | Internal::Digits | Internal::HatUnderscoreAprostoph)))
-        break;
-      lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-      if (!(lc & (Internal::AsciiLetters | Internal::Digits | Internal::HatUnderscoreAprostoph)))
-        break;
-      lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-      if (!(lc & (Internal::AsciiLetters | Internal::Digits | Internal::HatUnderscoreAprostoph)))
-        break;
-      lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-      if (!(lc & (Internal::AsciiLetters | Internal::Digits | Internal::HatUnderscoreAprostoph)))
-        break;
-      end++;
+
+#ifdef JSON_STRUCT_HAS_NEON
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16)) {
+    size_t consumed = Internal::findAsciiEndNEON(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index);
+
+    if (consumed < json_data.size - cursor_index) {
+      *chars_ahead = consumed;
+      return Error::NoError;
     }
+    end = cursor_index + consumed;
+  }
+#elif defined(JSON_STRUCT_HAS_SSE2)
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16)) {
+    size_t consumed = Internal::findAsciiEndSIMD(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index);
+
+    if (consumed < json_data.size - cursor_index) {
+      *chars_ahead = consumed;
+      return Error::NoError;
+    }
+    end = cursor_index + consumed;
+  }
+#endif
+
+  JSON_STRUCT_PREFETCH(json_data.data + end + 64);
+
+  while (JSON_STRUCT_LIKELY(end < json_data.size))
+  {
+    const char* search_start = json_data.data + end;
+    const char* search_end = json_data.data + json_data.size;
+    const char* found = std::find_if(search_start, search_end, [](char c) {
+      unsigned char lc = Internal::lookup()[(unsigned char)c];
+      return !(lc & (Internal::AsciiLetters | Internal::Digits | Internal::HatUnderscoreAprostoph));
+    });
+    end = found - json_data.data;
+
+    if (end >= json_data.size)
+      break;
 
     char ascii_code = json_data.data[end];
     if ((ascii_code >= 'A' && ascii_code <= 'Z') || (ascii_code >= '^' && ascii_code <= 'z') ||
@@ -1075,93 +2001,180 @@ inline Error Tokenizer::findAsciiEnd(const DataRef &json_data, size_t *chars_ahe
   return Error::NeedMoreData;
 }
 
-inline Error Tokenizer::findNumberEnd(const DataRef &json_data, size_t *chars_ahead)
+JSON_STRUCT_FORCE_INLINE Error Tokenizer::findNumberEnd(const DataRef &json_data, size_t *chars_ahead)
 {
-  size_t end = cursor_index;
-  while (end + 4 < json_data.size)
-  {
-    unsigned char lc = Internal::lookup()[(unsigned char)json_data.data[end]];
-    if (!(lc & (Internal::NumberEnd)))
-      break;
-    lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-    if (!(lc & (Internal::NumberEnd)))
-      break;
-    lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-    if (!(lc & (Internal::NumberEnd)))
-      break;
-    lc = Internal::lookup()[(unsigned char)json_data.data[++end]];
-    if (!(lc & (Internal::NumberEnd)))
-      break;
-    end++;
-  }
-  while (end < json_data.size)
-  {
-    unsigned char lc = Internal::lookup()[(unsigned char)json_data.data[end]];
-    if (lc & (Internal::NumberEnd))
-    {
-      end++;
-    }
-    else
-    {
-      *chars_ahead = end - cursor_index;
+#ifdef JSON_STRUCT_HAS_NEON
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16)) {
+    size_t consumed = Internal::findNumberEndNEON(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index);
+
+    if (consumed > 0 && cursor_index + consumed < json_data.size) {
+      *chars_ahead = consumed;
       return Error::NoError;
     }
+  }
+#elif defined(JSON_STRUCT_HAS_SSE2)
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16)) {
+    size_t consumed = Internal::findNumberEndSIMD(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index);
+
+    if (consumed > 0 && cursor_index + consumed < json_data.size) {
+      *chars_ahead = consumed;
+      return Error::NoError;
+    }
+  }
+#endif
+
+  size_t end = cursor_index;
+  JSON_STRUCT_PREFETCH(json_data.data + end + 64);
+
+  const char* search_start = json_data.data + end;
+  const char* search_end = json_data.data + json_data.size;
+  const char* found = std::find_if(search_start, search_end, [](char c) {
+    unsigned char lc = Internal::lookup()[(unsigned char)c];
+    return !(lc & Internal::NumberEnd);
+  });
+
+  end = found - json_data.data;
+  if (end < json_data.size)
+  {
+    *chars_ahead = end - cursor_index;
+    return Error::NoError;
   }
   return Error::NeedMoreData;
 }
 
-inline Error Tokenizer::findStartOfNextValue(Type *type, const DataRef &json_data, size_t *chars_ahead)
+JSON_STRUCT_FORCE_INLINE Error Tokenizer::findStartOfNextValue(Type *type, const DataRef &json_data, size_t *chars_ahead)
 {
 
   assert(property_state == InPropertyState::NoStartFound);
 
-  for (size_t current_pos = cursor_index; current_pos < json_data.size; current_pos++)
+  // Skip whitespace using SIMD if available
+  size_t current_pos = cursor_index;
+#ifdef JSON_STRUCT_HAS_AVX2
+  if (JSON_STRUCT_LIKELY(json_data.size - current_pos >= 32)) {
+    size_t ws_skipped = Internal::skipWhitespaceAVX2(
+      json_data.data + current_pos,
+      json_data.size - current_pos);
+    current_pos += ws_skipped;
+  }
+#elif defined(JSON_STRUCT_HAS_NEON)
+  if (JSON_STRUCT_LIKELY(json_data.size - current_pos >= 16)) {
+    size_t ws_skipped = Internal::skipWhitespaceNEON(
+      json_data.data + current_pos,
+      json_data.size - current_pos);
+    current_pos += ws_skipped;
+  }
+#elif defined(JSON_STRUCT_HAS_SSE2)
+  if (JSON_STRUCT_LIKELY(json_data.size - current_pos >= 16)) {
+    size_t ws_skipped = Internal::skipWhitespaceSIMD(
+      json_data.data + current_pos,
+      json_data.size - current_pos);
+    current_pos += ws_skipped;
+  }
+#endif
+
+  // Fast path: check first character after whitespace for single-char tokens
+  if (JSON_STRUCT_LIKELY(current_pos < json_data.size))
   {
     const char c = json_data.data[current_pos];
-    unsigned char lc = Internal::lookup()[(unsigned char)c];
-    if (c == '"')
+
+    // Most common single-character tokens - optimized with direct comparison
+    if (JSON_STRUCT_LIKELY(c == '"'))
     {
       *type = Type::String;
       *chars_ahead = current_pos - cursor_index;
       return Error::NoError;
     }
-    else if (c == '{')
+    else if (JSON_STRUCT_LIKELY(c == '{'))
     {
       *type = Type::ObjectStart;
       *chars_ahead = current_pos - cursor_index;
       return Error::NoError;
     }
-    else if (c == '}')
+    else if (JSON_STRUCT_LIKELY(c == '}'))
     {
       *type = Type::ObjectEnd;
       *chars_ahead = current_pos - cursor_index;
       return Error::NoError;
     }
-    else if (c == '[')
+    else if (JSON_STRUCT_LIKELY(c == '['))
     {
       *type = Type::ArrayStart;
       *chars_ahead = current_pos - cursor_index;
       return Error::NoError;
     }
-    else if (c == ']')
+    else if (JSON_STRUCT_LIKELY(c == ']'))
     {
       *type = Type::ArrayEnd;
       *chars_ahead = current_pos - cursor_index;
       return Error::NoError;
     }
-    else if (lc & (Internal::PlusOrMinus | Internal::Digits))
+  }
+
+  for (; current_pos < json_data.size; current_pos++)
+  {
+    const char c = json_data.data[current_pos];
+    unsigned char lc = Internal::lookup()[(unsigned char)c];
+
+    if (JSON_STRUCT_UNLIKELY(allow_comments && c == '/' && current_pos + 1 < json_data.size && json_data.data[current_pos + 1] == '/'))
+    {
+      cursor_index = current_pos + 2;
+      size_t comment_skip;
+      Error comment_error = skipComment(json_data, &comment_skip);
+      if (comment_error != Error::NoError)
+        return comment_error;
+
+      cursor_index += comment_skip;
+      current_pos = cursor_index - 1;
+      continue;
+    }
+
+    if (JSON_STRUCT_LIKELY(c == '"'))
+    {
+      *type = Type::String;
+      *chars_ahead = current_pos - cursor_index;
+      return Error::NoError;
+    }
+    else if (JSON_STRUCT_LIKELY(c == '{'))
+    {
+      *type = Type::ObjectStart;
+      *chars_ahead = current_pos - cursor_index;
+      return Error::NoError;
+    }
+    else if (JSON_STRUCT_LIKELY(c == '}'))
+    {
+      *type = Type::ObjectEnd;
+      *chars_ahead = current_pos - cursor_index;
+      return Error::NoError;
+    }
+    else if (JSON_STRUCT_LIKELY(c == '['))
+    {
+      *type = Type::ArrayStart;
+      *chars_ahead = current_pos - cursor_index;
+      return Error::NoError;
+    }
+    else if (JSON_STRUCT_LIKELY(c == ']'))
+    {
+      *type = Type::ArrayEnd;
+      *chars_ahead = current_pos - cursor_index;
+      return Error::NoError;
+    }
+    else if (JSON_STRUCT_LIKELY(lc & (Internal::PlusOrMinus | Internal::Digits)))
     {
       *type = Type::Number;
       *chars_ahead = current_pos - cursor_index;
       return Error::NoError;
     }
-    else if (lc & Internal::AsciiLetters)
+    else if (JSON_STRUCT_LIKELY(lc & Internal::AsciiLetters))
     {
       *type = Type::Ascii;
       *chars_ahead = current_pos - cursor_index;
       return Error::NoError;
     }
-    else if (lc == 0)
+    else if (JSON_STRUCT_UNLIKELY(lc == 0))
     {
       *chars_ahead = current_pos - cursor_index;
       return Error::EncounteredIllegalChar;
@@ -1170,38 +2183,84 @@ inline Error Tokenizer::findStartOfNextValue(Type *type, const DataRef &json_dat
   return Error::NeedMoreData;
 }
 
-inline Error Tokenizer::findDelimiter(const DataRef &json_data, size_t *chars_ahead)
+JSON_STRUCT_FORCE_INLINE Error Tokenizer::findDelimiter(const DataRef &json_data, size_t *chars_ahead)
 {
-  if (container_stack.empty())
+  if (JSON_STRUCT_UNLIKELY(container_stack.empty()))
     return Error::IllegalPropertyType;
-  for (size_t end = cursor_index; end < json_data.size; end++)
+
+  // Skip whitespace using SIMD if available
+  size_t end = cursor_index;
+#ifdef JSON_STRUCT_HAS_AVX2
+  if (JSON_STRUCT_LIKELY(json_data.size - end >= 32 && !allow_new_lines)) {
+    size_t ws_skipped = Internal::skipWhitespaceAVX2(
+      json_data.data + end,
+      json_data.size - end);
+    end += ws_skipped;
+  }
+#elif defined(JSON_STRUCT_HAS_NEON)
+  if (JSON_STRUCT_LIKELY(json_data.size - end >= 16 && !allow_new_lines)) {
+    size_t ws_skipped = Internal::skipWhitespaceNEON(
+      json_data.data + end,
+      json_data.size - end);
+    end += ws_skipped;
+  }
+#elif defined(JSON_STRUCT_HAS_SSE2)
+  if (JSON_STRUCT_LIKELY(json_data.size - end >= 16 && !allow_new_lines)) {
+    size_t ws_skipped = Internal::skipWhitespaceSIMD(
+      json_data.data + end,
+      json_data.size - end);
+    end += ws_skipped;
+  }
+#endif
+
+  // Prefetch ahead for better cache utilization
+  JSON_STRUCT_PREFETCH(json_data.data + end + 64);
+
+  for (; end < json_data.size; end++)
   {
     const char c = json_data.data[end];
-    if (c == ':')
+
+    if (JSON_STRUCT_UNLIKELY(allow_comments && c == '/' && end + 1 < json_data.size && json_data.data[end + 1] == '/'))
     {
-      if (container_stack.back() != Type::ObjectStart)
+      cursor_index = end + 2;
+      size_t comment_skip;
+      Error comment_error = skipComment(json_data, &comment_skip);
+      if (comment_error != Error::NoError)
+        return comment_error;
+
+      cursor_index += comment_skip;
+      end = cursor_index - 1;
+      continue;
+    }
+
+    // Cache container type to avoid multiple back() calls
+    Type container_type = container_stack.back();
+
+    if (JSON_STRUCT_LIKELY(c == ':'))
+    {
+      if (JSON_STRUCT_UNLIKELY(container_type != Type::ObjectStart))
         return Error::ExpectedDelimiter;
       token_state = InTokenState::FindingData;
       *chars_ahead = end + 1 - cursor_index;
       return Error::NoError;
     }
-    else if (c == ',')
+    else if (JSON_STRUCT_LIKELY(c == ',') || JSON_STRUCT_UNLIKELY(allow_new_lines && c == '\n'))
     {
-      if (container_stack.back() != Type::ArrayStart)
+      if (JSON_STRUCT_UNLIKELY(container_type != Type::ArrayStart))
         return Error::ExpectedDelimiter;
       token_state = InTokenState::FindingName;
       *chars_ahead = end + 1 - cursor_index;
       return Error::NoError;
     }
-    else if (c == ']')
+    else if (JSON_STRUCT_LIKELY(c == ']'))
     {
-      if (container_stack.back() != Type::ArrayStart)
+      if (JSON_STRUCT_UNLIKELY(container_type != Type::ArrayStart))
         return Error::ExpectedDelimiter;
       token_state = InTokenState::FindingName;
       *chars_ahead = end - cursor_index;
       return Error::NoError;
     }
-    else if (!(Internal::lookup()[(unsigned char)c] & Internal::WhiteSpaceOrNull))
+    else if (JSON_STRUCT_UNLIKELY(!(Internal::lookup()[(unsigned char)c] & Internal::WhiteSpaceOrNull)))
     {
       return Error::ExpectedDelimiter;
     }
@@ -1209,25 +2268,68 @@ inline Error Tokenizer::findDelimiter(const DataRef &json_data, size_t *chars_ah
   return Error::NeedMoreData;
 }
 
-inline Error Tokenizer::findTokenEnd(const DataRef &json_data, size_t *chars_ahead)
+JSON_STRUCT_FORCE_INLINE Error Tokenizer::findTokenEnd(const DataRef &json_data, size_t *chars_ahead)
 {
-  if (container_stack.empty())
+  if (JSON_STRUCT_UNLIKELY(container_stack.empty()))
     return Error::NoError;
-  for (size_t end = cursor_index; end < json_data.size; end++)
+
+  // Skip whitespace using SIMD if available
+  size_t end = cursor_index;
+#ifdef JSON_STRUCT_HAS_AVX2
+  if (JSON_STRUCT_LIKELY(json_data.size - end >= 32 && !allow_ascii_properties)) {
+    size_t ws_skipped = Internal::skipWhitespaceAVX2(
+      json_data.data + end,
+      json_data.size - end);
+    end += ws_skipped;
+  }
+#elif defined(JSON_STRUCT_HAS_NEON)
+  if (JSON_STRUCT_LIKELY(json_data.size - end >= 16 && !allow_ascii_properties)) {
+    size_t ws_skipped = Internal::skipWhitespaceNEON(
+      json_data.data + end,
+      json_data.size - end);
+    end += ws_skipped;
+  }
+#elif defined(JSON_STRUCT_HAS_SSE2)
+  if (JSON_STRUCT_LIKELY(json_data.size - end >= 16 && !allow_ascii_properties)) {
+    size_t ws_skipped = Internal::skipWhitespaceSIMD(
+      json_data.data + end,
+      json_data.size - end);
+    end += ws_skipped;
+  }
+#endif
+
+  // Prefetch ahead for better cache utilization
+  JSON_STRUCT_PREFETCH(json_data.data + end + 64);
+
+  for (; end < json_data.size; end++)
   {
     const char c = json_data.data[end];
-    if (c == ',')
+
+    if (JSON_STRUCT_UNLIKELY(allow_comments && c == '/' && end + 1 < json_data.size && json_data.data[end + 1] == '/'))
     {
-      expecting_prop_or_annonymous_data = true;
+      cursor_index = end + 2;
+      size_t comment_skip;
+      Error comment_error = skipComment(json_data, &comment_skip);
+      if (comment_error != Error::NoError)
+        return comment_error;
+
+      cursor_index += comment_skip;
+      end = cursor_index - 1;
+      continue;
+    }
+
+    if (JSON_STRUCT_LIKELY(c == ','))
+    {
+      expecting_prop_or_anonymous_data = true;
       *chars_ahead = end + 1 - cursor_index;
       return Error::NoError;
     }
-    else if (c == ']' || c == '}')
+    if (JSON_STRUCT_LIKELY(c == ']' || c == '}'))
     {
       *chars_ahead = end - cursor_index;
       return Error::NoError;
     }
-    else if (c == '\n')
+    if (JSON_STRUCT_UNLIKELY(c == '\n'))
     {
       if (allow_new_lines)
       {
@@ -1235,7 +2337,7 @@ inline Error Tokenizer::findTokenEnd(const DataRef &json_data, size_t *chars_ahe
         return Error::NoError;
       }
     }
-    else if (Internal::lookup()[(unsigned char)c] & Internal::WhiteSpaceOrNull)
+    else if (JSON_STRUCT_LIKELY(Internal::lookup()[(unsigned char)c] & Internal::WhiteSpaceOrNull))
     {
       continue;
     }
@@ -1248,6 +2350,53 @@ inline Error Tokenizer::findTokenEnd(const DataRef &json_data, size_t *chars_ahe
   return Error::NeedMoreData;
 }
 
+inline Error Tokenizer::skipComment(const DataRef &json_data, size_t *chars_ahead)
+{
+#ifdef JSON_STRUCT_HAS_NEON
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16 && !allow_new_lines)) {
+    size_t consumed = Internal::skipCommentNEON(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index);
+
+    if (consumed > 0 && cursor_index + consumed <= json_data.size &&
+        json_data.data[cursor_index + consumed - 1] == '\n') {
+      *chars_ahead = consumed;
+      return Error::NoError;
+    }
+  }
+#elif defined(JSON_STRUCT_HAS_SSE2)
+  if (JSON_STRUCT_LIKELY(json_data.size - cursor_index >= 16 && !allow_new_lines)) {
+    size_t consumed = Internal::skipCommentSIMD(
+      json_data.data + cursor_index,
+      json_data.size - cursor_index);
+
+    if (consumed > 0 && cursor_index + consumed <= json_data.size &&
+        json_data.data[cursor_index + consumed - 1] == '\n') {
+      *chars_ahead = consumed;
+      return Error::NoError;
+    }
+  }
+#endif
+
+  const char* start = json_data.data + cursor_index;
+  const char* end = json_data.data + json_data.size;
+  const char* found = std::find(start, end, '\n');
+
+  if (found != end)
+  {
+    if (allow_new_lines)
+    {
+      *chars_ahead = (found - start);
+    }
+    else
+    {
+      *chars_ahead = (found - start) + 1;
+    }
+    return Error::NoError;
+  }
+  return Error::NeedMoreData;
+}
+
 inline void Tokenizer::requestMoreData()
 {
   if (need_more_data_callback)
@@ -1256,15 +2405,16 @@ inline void Tokenizer::requestMoreData()
 
 inline void Tokenizer::releaseFirstDataRef()
 {
-  if (data_list.empty())
+  if (JSON_STRUCT_UNLIKELY(data_list.empty()))
     return;
 
   const DataRef &json_data = data_list.front();
 
+  // Optimize string operations: append directly instead of creating temporary
   for (auto &copy_pair : copy_buffers)
   {
-    std::string data(json_data.data + copy_pair.first, json_data.size - copy_pair.first);
-    *copy_pair.second += data;
+    size_t copy_size = json_data.size - copy_pair.first;
+    copy_pair.second->append(json_data.data + copy_pair.first, copy_size);
     copy_pair.first = 0;
   }
 
@@ -1314,21 +2464,24 @@ inline Error Tokenizer::populateFromDataRef(DataRef &data, Type &type, const Dat
   }
 
   size_t negative_size_adjustment = 0;
-  if (property_state == InPropertyState::FindingEnd)
+  if (JSON_STRUCT_LIKELY(property_state == InPropertyState::FindingEnd))
   {
-    switch (type)
+    // Use jump table optimization with likely paths
+    if (JSON_STRUCT_LIKELY(type == Type::String))
     {
-    case Type::String:
       error = findStringEnd(json_data, &diff);
       negative_size_adjustment = 1;
-      break;
-    case Type::Ascii:
-      error = findAsciiEnd(json_data, &diff);
-      break;
-    case Type::Number:
+    }
+    else if (JSON_STRUCT_LIKELY(type == Type::Number))
+    {
       error = findNumberEnd(json_data, &diff);
-      break;
-    default:
+    }
+    else if (JSON_STRUCT_LIKELY(type == Type::Ascii))
+    {
+      error = findAsciiEnd(json_data, &diff);
+    }
+    else
+    {
       return Error::InvalidToken;
     }
 
@@ -1345,7 +2498,7 @@ inline Error Tokenizer::populateFromDataRef(DataRef &data, Type &type, const Dat
   return Error::NoError;
 }
 
-inline void Tokenizer::populate_annonymous_token(const DataRef &data, Type type, Token &token)
+inline void Tokenizer::populate_anonymous_token(const DataRef &data, Type type, Token &token)
 {
   token.name = DataRef();
   token.name_type = Type::Ascii;
@@ -1355,27 +2508,39 @@ inline void Tokenizer::populate_annonymous_token(const DataRef &data, Type type,
 
 namespace Internal
 {
-static Type getType(Type type, const char *data, size_t length)
+// Optimized keyword detection using integer comparison for small strings
+static JSON_STRUCT_FORCE_INLINE Type getType(Type type, const char *data, size_t length)
 {
-  static const char m_null[] = "null";
-  static const char m_true[] = "true";
-  static const char m_false[] = "false";
-  if (type != Type::Ascii)
+  if (JSON_STRUCT_LIKELY(type != Type::Ascii))
     return type;
-  if (sizeof(m_null) - 1 == length)
+
+  // Fast path: use integer comparison instead of memcmp
+  // "null" = 4 bytes, "true" = 4 bytes, "false" = 5 bytes
+  if (JSON_STRUCT_LIKELY(length == 4))
   {
-    if (memcmp(m_null, data, length) == 0)
-    {
+    // Load as uint32_t for single comparison
+    uint32_t word;
+    memcpy(&word, data, 4);
+
+    // "null" = 0x6c6c756e (little endian)
+    constexpr uint32_t null_word = 0x6c6c756e;
+    if (word == null_word)
       return Type::Null;
-    }
-    else if (memcmp(m_true, data, length) == 0)
-    {
+
+    // "true" = 0x65757274 (little endian)
+    constexpr uint32_t true_word = 0x65757274;
+    if (word == true_word)
       return Type::Bool;
-    }
   }
-  if (sizeof(m_false) - 1 == length)
+  else if (JSON_STRUCT_UNLIKELY(length == 5))
   {
-    if (memcmp(m_false, data, length) == 0)
+    // "false" - check first 4 bytes + last byte
+    uint32_t word;
+    memcpy(&word, data, 4);
+
+    // "fals" = 0x736c6166 (little endian)
+    constexpr uint32_t false_word = 0x736c6166;
+    if (word == false_word && data[4] == 'e')
       return Type::Bool;
   }
   return Type::Ascii;
@@ -1436,18 +2601,18 @@ inline Error Tokenizer::populateNextTokenFromDataRef(Token &next_token, const Da
         {
         case Type::ObjectEnd:
         case Type::ArrayEnd:
-          if (expecting_prop_or_annonymous_data && !allow_superfluous_comma)
+          if (expecting_prop_or_anonymous_data && !allow_superfluous_comma)
           {
             return Error::ExpectedDataToken;
           }
-          populate_annonymous_token(data, type, next_token);
+          populate_anonymous_token(data, type, next_token);
           token_state = InTokenState::FindingTokenEnd;
           return Error::NoError;
 
         case Type::ObjectStart:
         case Type::ArrayStart:
-          populate_annonymous_token(data, type, next_token);
-          expecting_prop_or_annonymous_data = false;
+          populate_anonymous_token(data, type, next_token);
+          expecting_prop_or_anonymous_data = false;
           token_state = InTokenState::FindingName;
           return Error::NoError;
         default:
@@ -1478,10 +2643,10 @@ inline Error Tokenizer::populateNextTokenFromDataRef(Token &next_token, const Da
       }
       cursor_index += diff;
       resetForNewValue();
-      expecting_prop_or_annonymous_data = false;
+      expecting_prop_or_anonymous_data = false;
       if (token_state == InTokenState::FindingName)
       {
-        populate_annonymous_token(tmp_token.name, tmp_token.name_type, next_token);
+        populate_anonymous_token(tmp_token.name, tmp_token.name_type, next_token);
         return Error::NoError;
       }
       else
@@ -1577,7 +2742,7 @@ struct Lines
 };
 } // namespace Internal
 
-inline Error Tokenizer::updateErrorContext(Error error, const std::string &custom_message)
+JSON_STRUCT_COLD inline Error Tokenizer::updateErrorContext(Error error, const std::string &custom_message)
 {
   error_context.error = error;
   error_context.custom_message = custom_message;

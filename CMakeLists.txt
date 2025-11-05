@@ -1,5 +1,5 @@
 ### Project
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.25)
 project(json_struct VERSION "1.0.3" HOMEPAGE_URL "https://github.com/jorgen/json_struct" DESCRIPTION "A library for parsing JSON directly to C++ structs and vice versa." LANGUAGES CXX)
 set(CPACK_PACKAGE_VENDOR "Jørgen Lind")
 
@@ -8,6 +8,11 @@ list(APPEND CMAKE_MODULE_PATH "${ADDITIONAL_MODULES_DIR}" "${ADDITIONAL_MODULES_
 
 set(CMAKE_CXX_STANDARD_REQUIRED FALSE)
 set(CMAKE_CXX_STANDARD 20)
+
+if(MSVC)
+add_compile_options(/arch:AVX2)
+endif()
+
 
 ### Misc
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
@@ -51,6 +56,18 @@ set(JSON_STRUCT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(JSON_STRUCT_OPT_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
+
+include(FetchContent)
+
+FetchContent_Declare(
+catch2
+GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+GIT_TAG v3.11.0
+GIT_SHALLOW TRUE
+SYSTEM
+)
+
+FetchContent_MakeAvailable(catch2)
 
 ### Tests
 if(JSON_STRUCT_OPT_BUILD_TESTS)
